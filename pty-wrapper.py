@@ -31,14 +31,27 @@ ANSI_RE = re.compile(
 )
 
 # --- Auto-approve patterns ---
-# Non-Bash tools: match tool name
-TOOL_RE = re.compile(r'(Read file|Read\(|Glob\(|Grep\()', re.IGNORECASE)
-# Bash commands: match raw command text + "Permission rule Bash"
-BASH_CMD_RE = re.compile(r'(?:^|\s)(ls|find|head|wc|cat|grep|tail|file|stat|du|df|pwd|echo|which|whoami|env|printenv)\s', re.IGNORECASE | re.MULTILINE)
-BASH_PERM_RE = re.compile(r'Permission rule Bash')
+# Non-Bash read-only tools
+TOOL_RE = re.compile(
+    r'(Read file|Read\s*\(|Glob\s*\(|Grep\s*\(|Glob\b|Grep\b|Read\b'
+    r'|ToolSearch\s*\(|ToolSearch\b'
+    r'|TaskGet\s*\(|TaskGet\b|TaskList\s*\(|TaskList\b)',
+    re.IGNORECASE,
+)
+# Bash read-only commands — match the command at start-of-line or after whitespace/pipe
+SAFE_BASH_CMDS = (
+    r'ls|find|head|wc|cat|grep|rg|tail|file|stat|du|df|pwd|echo|which'
+    r'|whoami|env|printenv|uname|hostname|date|id|git\s+(status|log|diff|show|branch|remote|tag)'
+)
+BASH_CMD_RE = re.compile(
+    rf'(?:^|\s|[|;])({SAFE_BASH_CMDS})(?:\s|$)',
+    re.IGNORECASE | re.MULTILINE,
+)
+# Permission label — Claude Code may phrase this differently across versions
+BASH_PERM_RE = re.compile(r'(Permission rule Bash|Bash\s*\()', re.IGNORECASE)
 # The approval prompt — require the Yes/No options to avoid false positives
 # when the script's own code is displayed on screen
-PROMPT_RE = re.compile(r'Do you want to proceed\?.*?1\..*?Yes', re.DOTALL)
+PROMPT_RE = re.compile(r'Do you want to proceed\?.*?Yes', re.DOTALL)
 
 
 MULTI_SPACE_RE = re.compile(r' {2,}')
@@ -106,8 +119,9 @@ def main() -> None:
     old_attrs = termios.tcgetattr(sys.stdin)
     tty.setraw(sys.stdin.fileno())
 
-    buf = b''
-    cooldown = 0.0  # timestamp: don't auto-approve again until after this time
+    text_buf = ''       # rolling window of STRIPPED text (not raw bytes)
+    cooldown = 0.0      # timestamp: don't auto-approve again until after this time
+    BUF_MAX = 16000     # characters of visible text — plenty for tool name + prompt
 
     try:
         while True:
@@ -119,26 +133,28 @@ def main() -> None:
             # Output from claude → our terminal
             if master_fd in rfds:
                 try:
-                    data = os.read(master_fd, 4096)
+                    data = os.read(master_fd, 16384)
                 except OSError:
                     break
                 os.write(sys.stdout.fileno(), data)
 
-                buf = (buf + data)[-4000:]  # keep a rolling window
+                # Buffer stripped text so ANSI bloat doesn't eat our window
+                text_buf = (text_buf + strip_ansi(data))[-BUF_MAX:]
                 now = time.monotonic()
 
-                if now > cooldown:
-                    text = strip_ansi(buf)
-                    if PROMPT_RE.search(text):
-                        is_safe_tool = bool(TOOL_RE.search(text))
-                        is_safe_bash = bool(BASH_CMD_RE.search(text) and BASH_PERM_RE.search(text))
-                        if is_safe_tool or is_safe_bash:
-                            time.sleep(0.1)
-                            os.write(master_fd, b'1')
-                            time.sleep(0.05)
-                            os.write(master_fd, b'\r')
-                            buf = b''
-                            cooldown = now + 1.0
+                if now > cooldown and PROMPT_RE.search(text_buf):
+                    is_safe_tool = bool(TOOL_RE.search(text_buf))
+                    is_safe_bash = bool(
+                        BASH_CMD_RE.search(text_buf)
+                        and BASH_PERM_RE.search(text_buf)
+                    )
+                    if is_safe_tool or is_safe_bash:
+                        time.sleep(0.1)
+                        os.write(master_fd, b'1')
+                        time.sleep(0.05)
+                        os.write(master_fd, b'\r')
+                        text_buf = ''
+                        cooldown = now + 1.0
 
             # Input from user → claude
             if sys.stdin.fileno() in rfds:
