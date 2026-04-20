@@ -49,9 +49,15 @@ BASH_CMD_RE = re.compile(
 )
 # Permission label — Claude Code may phrase this differently across versions
 BASH_PERM_RE = re.compile(r'(Permission rule Bash|Bash\s*\()', re.IGNORECASE)
-# The approval prompt — require the Yes/No options to avoid false positives
-# when the script's own code is displayed on screen
-PROMPT_RE = re.compile(r'Do you want to proceed\?.*?Yes', re.DOTALL)
+# The approval prompt — require the numbered bullet form Claude Code
+# actually renders ("1. Yes"), not just any "Yes". Bounded distance keeps
+# it from spanning unrelated output.
+PROMPT_RE = re.compile(r'Do you want to proceed\?.{0,400}?\b1\.\s*Yes\b', re.DOTALL)
+# Only trust signals inside the trailing slice of visible output — the
+# live prompt is always at the bottom of the screen. Without this, prose
+# or quoted code higher up (e.g. this script's own patterns discussed in
+# chat) can spuriously match.
+TAIL_WINDOW = 1500
 
 
 MULTI_SPACE_RE = re.compile(r' {2,}')
@@ -142,11 +148,12 @@ def main() -> None:
                 text_buf = (text_buf + strip_ansi(data))[-BUF_MAX:]
                 now = time.monotonic()
 
-                if now > cooldown and PROMPT_RE.search(text_buf):
-                    is_safe_tool = bool(TOOL_RE.search(text_buf))
+                tail = text_buf[-TAIL_WINDOW:]
+                if now > cooldown and PROMPT_RE.search(tail):
+                    is_safe_tool = bool(TOOL_RE.search(tail))
                     is_safe_bash = bool(
-                        BASH_CMD_RE.search(text_buf)
-                        and BASH_PERM_RE.search(text_buf)
+                        BASH_CMD_RE.search(tail)
+                        and BASH_PERM_RE.search(tail)
                     )
                     if is_safe_tool or is_safe_bash:
                         time.sleep(0.1)
