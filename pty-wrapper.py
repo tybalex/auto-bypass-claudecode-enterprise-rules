@@ -38,17 +38,19 @@ TOOL_RE = re.compile(
     r'|TaskGet\s*\(|TaskGet\b|TaskList\s*\(|TaskList\b)',
     re.IGNORECASE,
 )
-# Bash read-only commands — match the command at start-of-line or after whitespace/pipe
+# Bash read-only commands. Git intentionally excluded: even read-only git
+# subcommands are not in the enterprise auto-approve ruleset.
 SAFE_BASH_CMDS = (
     r'ls|find|head|wc|cat|grep|rg|tail|file|stat|du|df|pwd|echo|which'
-    r'|whoami|env|printenv|uname|hostname|date|id|git\s+(status|log|diff|show|branch|remote|tag)'
+    r'|whoami|env|printenv|uname|hostname|date|id'
 )
+# Must match the FIRST command inside Bash(...). Matching after a pipe would
+# greenlight pipelines like `Bash(git log ... | head -5)` because `head` is
+# safe — even though the command starts with an unapproved `git`.
 BASH_CMD_RE = re.compile(
-    rf'(?:^|\s|[|;])({SAFE_BASH_CMDS})(?:\s|$)',
-    re.IGNORECASE | re.MULTILINE,
+    rf'Bash\s*\(\s*({SAFE_BASH_CMDS})\b',
+    re.IGNORECASE,
 )
-# Permission label — Claude Code may phrase this differently across versions
-BASH_PERM_RE = re.compile(r'(Permission rule Bash|Bash\s*\()', re.IGNORECASE)
 # The approval prompt — require the numbered bullet form Claude Code
 # actually renders ("1. Yes"), not just any "Yes". Bounded distance keeps
 # it from spanning unrelated output.
@@ -57,7 +59,7 @@ PROMPT_RE = re.compile(r'Do you want to proceed\?.{0,400}?\b1\.\s*Yes\b', re.DOT
 # live prompt is always at the bottom of the screen. Without this, prose
 # or quoted code higher up (e.g. this script's own patterns discussed in
 # chat) can spuriously match.
-TAIL_WINDOW = 1500
+TAIL_WINDOW = 800
 
 
 MULTI_SPACE_RE = re.compile(r' {2,}')
@@ -151,17 +153,33 @@ def main() -> None:
                 tail = text_buf[-TAIL_WINDOW:]
                 if now > cooldown and PROMPT_RE.search(tail):
                     is_safe_tool = bool(TOOL_RE.search(tail))
-                    is_safe_bash = bool(
-                        BASH_CMD_RE.search(tail)
-                        and BASH_PERM_RE.search(tail)
-                    )
+                    is_safe_bash = bool(BASH_CMD_RE.search(tail))
                     if is_safe_tool or is_safe_bash:
+                        # Set cooldown immediately: even if re-verify aborts,
+                        # we don't want to re-fire on the same stale buffer.
+                        cooldown = now + 3.0
+                        # Let Claude settle, then drain any new output that
+                        # arrived during the pause and re-verify the prompt
+                        # is STILL on screen. Without this, auto-dismissed
+                        # prompts cause us to inject "1" into the idle
+                        # chat input line after the prompt is gone.
                         time.sleep(0.1)
-                        os.write(master_fd, b'1')
-                        time.sleep(0.05)
-                        os.write(master_fd, b'\r')
-                        text_buf = ''
-                        cooldown = now + 1.0
+                        try:
+                            while True:
+                                r2, _, _ = select.select([master_fd], [], [], 0)
+                                if master_fd not in r2:
+                                    break
+                                more = os.read(master_fd, 16384)
+                                if not more:
+                                    break
+                                os.write(sys.stdout.fileno(), more)
+                                text_buf = (text_buf + strip_ansi(more))[-BUF_MAX:]
+                        except OSError:
+                            pass
+                        tail = text_buf[-TAIL_WINDOW:]
+                        if PROMPT_RE.search(tail):
+                            os.write(master_fd, b'1\r')
+                            text_buf = ''
 
             # Input from user → claude
             if sys.stdin.fileno() in rfds:
