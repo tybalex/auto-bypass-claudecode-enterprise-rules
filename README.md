@@ -20,8 +20,10 @@ A Python PTY wrapper (`pty-wrapper.py`) that:
 
 | Type | Actions |
 |------|---------|
-| **Tools** | `Read`, `Glob`, `Grep` |
-| **Bash commands** | `ls`, `find`, `head`, `wc`, `cat`, `grep`, `tail`, `file`, `stat`, `du`, `df`, `pwd`, `echo`, `which`, `whoami`, `env`, `printenv` |
+| **Tools** | `Read`, `Glob`, `Grep`, `ToolSearch`, `TaskGet`, `TaskList` |
+| **Bash commands** | `ls`, `find`, `head`, `wc`, `cat`, `grep`, `rg`, `tail`, `file`, `stat`, `du`, `df`, `pwd`, `echo`, `which`, `whoami`, `env`, `printenv`, `uname`, `hostname`, `date`, `id` |
+
+Read-only `git` (`status`, `log`, `diff`, …) is **not** auto-approved by default — the enterprise ruleset doesn't auto-approve git either. See [Customization](#customization) to add it.
 
 ## Setup
 
@@ -69,11 +71,33 @@ claude CLI (subprocess)
 
 1. Creates a PTY pair and forks — child process becomes `claude`
 2. Parent bridges master PTY ↔ real terminal in a `select()` loop
-3. Buffers the last 4KB of terminal output, strips ANSI escape codes
-4. Pattern-matches for: tool name (`Read`, `Grep`, etc.) or safe bash command (`ls`, `find`, etc.) + `"Do you want to proceed?"` + `"1. Yes"`
-5. When matched, sends `1` + Enter to accept the first option ("Yes")
-6. 1-second cooldown between auto-approvals to prevent double-firing
-7. Handles `SIGWINCH` to forward terminal resize events
+3. Strips ANSI escape codes and buffers the visible text
+4. Detects an approval when **both** hold:
+   - the real menu (`"Do you want to proceed?"` → `"1. Yes"` → `"2."`) is at the **bottom** of the screen, and
+   - the **most recent tool-call header** anywhere in the buffer is a safe read-only tool (or `Bash(<safe-cmd>…)`)
+5. Re-verifies the prompt is still on screen, then sends `1` + Enter to accept "Yes"
+6. Handles `SIGWINCH` to forward terminal resize events
+
+### Reliability details
+
+Earlier versions intermittently left `find`/`grep` prompts waiting for manual
+approval. Three things caused that, all addressed now:
+
+- **Tool identified from the whole buffer, not a fixed window.** A long
+  `find`/`grep` command (or a tall prompt box) pushed the `● Bash(…)` / `Grep(…)`
+  header far above the `1. Yes` line. The old code required both within ~800–1500
+  characters of each other, so it missed those. Detection now matches the prompt
+  at the bottom of the screen but identifies the pending tool from the **last
+  tool-call header anywhere in the buffer**.
+- **Re-checks on idle, not only on new output.** The detector runs every loop
+  turn — including the `select()` timeout — so a prompt that finished rendering
+  and then sits static still gets approved.
+- **No stray `1`.** An `armed` latch (cleared on fire, re-armed only once the
+  screen shows no prompt) plus a short cooldown stop a just-answered prompt from
+  re-triggering a `1` into the chat input.
+
+> **Note:** the wrapper loads the script once at launch. After updating
+> `pty-wrapper.py`, **restart your `cw` session** for changes to take effect.
 
 ### Why PTY instead of hooks or Agent SDK?
 
@@ -87,32 +111,45 @@ We tried several approaches:
 
 ## Customization
 
-### Adding more safe commands
+### Adding more safe bash commands
 
-Edit the `BASH_CMD_RE` pattern in `pty-wrapper.py`:
+Edit the `SAFE_BASH_CMDS` alternation in `pty-wrapper.py` (it's matched against
+the start of the command inside `Bash(...)`):
 
 ```python
-BASH_CMD_RE = re.compile(
-    r'(?:^|\s)(ls|find|head|wc|cat|grep|tail|YOUR_COMMAND_HERE)\s',
-    re.IGNORECASE | re.MULTILINE,
+SAFE_BASH_CMDS = (
+    r'ls|find|head|wc|cat|grep|rg|tail|file|stat|du|df|pwd|echo|which'
+    r'|whoami|env|printenv|uname|hostname|date|id|YOUR_COMMAND_HERE'
 )
 ```
+
+To also auto-approve read-only git, append `|git\s+(status|log|diff|show|branch|remote|tag)`.
 
 ### Adding more safe tools
 
-Edit the `TOOL_RE` pattern:
+Add the tool name to the `SAFE_TOOLS` tuple:
 
 ```python
-TOOL_RE = re.compile(
-    r'(Read file|Read\(|Glob\(|Grep\(|YOUR_TOOL_HERE)',
-    re.IGNORECASE,
-)
+SAFE_TOOLS = ('Read', 'Glob', 'Grep', 'ToolSearch', 'TaskGet', 'TaskList', 'YourTool')
 ```
+
+## Tests
+
+The detection logic is covered by an offline harness (no `claude` needed):
+
+```bash
+python3 test_detector.py
+```
+
+It feeds recorded, ANSI-stripped prompt renders through the detector and
+asserts the fire/no-fire decisions — including the long-command, static-prompt,
+burst, and stray-`1` cases above.
 
 ## Known Limitations
 
 - The approval prompt will briefly flash on screen before being auto-accepted
-- If you edit/display this script's source code inside a `cw` session, the wrapper may false-positive match its own regex patterns in the terminal output (fixed by requiring the full `"1. Yes"` UI pattern)
+- Detection requires the real menu structure (`1. Yes` → `2.`) at the bottom of the screen, so merely *quoting* the prompt in chat won't trigger it. The unavoidable edge case: if the literal menu text is reproduced verbatim at the very bottom of the visible screen with a tool header above it, it can still match.
+- Rare back-to-back prompts with a tiny result between them may fall back to manual approval (the safe failure) rather than auto-approving the second.
 - Only works on macOS/Linux (uses `pty`, `fork`, `termios`)
 
 ## License

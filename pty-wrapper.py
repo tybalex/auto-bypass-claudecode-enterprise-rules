@@ -7,6 +7,18 @@ Usage:
   python3.13 ~/.claude/pty-wrapper.py [any claude args...]
   e.g.  python3.13 ~/.claude/pty-wrapper.py
         python3.13 ~/.claude/pty-wrapper.py --model sonnet
+
+Detection design (see test_detector.py for the spec it must satisfy):
+  * The PROMPT must be at the BOTTOM of the screen (matched in a short tail) —
+    this keeps prose/quoted text higher up from triggering us.
+  * The pending TOOL is identified by the LAST tool-call header anywhere in the
+    buffer, not just the tail. Long `find`/`grep` commands push their
+    `● Bash(...)` / `Grep(...)` header far above the prompt; classifying from
+    the whole buffer (not a 1500-char window) is what makes those reliable.
+  * Detection re-runs on the select() timeout, not only when new bytes arrive,
+    so a prompt that finishes rendering and then sits STATIC still gets caught.
+  * An `armed` latch + short cooldown together prevent re-firing a stray "1"
+    into the chat input after a prompt has already been answered.
 """
 import fcntl
 import os
@@ -29,46 +41,120 @@ ANSI_RE = re.compile(
     rb'|[^[\]].?'                 # two-byte sequences
     rb')'
 )
+MULTI_SPACE_RE = re.compile(r' {2,}')
 
-# --- Auto-approve patterns ---
-# Non-Bash read-only tools
-TOOL_RE = re.compile(
-    r'(Read file|Read\s*\(|Glob\s*\(|Grep\s*\(|Glob\b|Grep\b|Read\b'
-    r'|ToolSearch\s*\(|ToolSearch\b'
-    r'|TaskGet\s*\(|TaskGet\b|TaskList\s*\(|TaskList\b)',
-    re.IGNORECASE,
+# --- Tool classification ---------------------------------------------------
+# Read-only tools we auto-approve.
+SAFE_TOOLS = ('Read', 'Glob', 'Grep', 'ToolSearch', 'TaskGet', 'TaskList')
+# Other tools we recognize purely so a pending unsafe tool is classified as
+# unsafe (and therefore NOT auto-approved) instead of falling back to an older,
+# already-answered safe header still sitting in the buffer.
+OTHER_TOOLS = (
+    'Bash', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'Task', 'Agent',
+    'WebFetch', 'WebSearch', 'TaskCreate', 'TaskUpdate', 'TaskStop',
+    'KillShell', 'BashOutput', 'SlashCommand', 'ExitPlanMode', 'EnterPlanMode',
 )
-# Bash read-only commands. Git intentionally excluded: even read-only git
-# subcommands are not in the enterprise auto-approve ruleset.
+# A tool-call header as Claude Code renders it: `Name(`. Requiring the paren
+# keeps us from matching the tool *names* when they appear in ordinary prose.
+KNOWN_TOOL_RE = re.compile(
+    r'\b(' + '|'.join(SAFE_TOOLS + OTHER_TOOLS) + r')\s*\(',
+)
+# Bash read-only commands, matched against the start of the command inside
+# `Bash(...)`. Git is intentionally excluded: even read-only git subcommands
+# are not in the enterprise auto-approve ruleset. To auto-approve read-only
+# git too, add `|git\s+(status|log|diff|show|branch|remote|tag)` here.
 SAFE_BASH_CMDS = (
     r'ls|find|head|wc|cat|grep|rg|tail|file|stat|du|df|pwd|echo|which'
     r'|whoami|env|printenv|uname|hostname|date|id'
 )
-# Must match the FIRST command inside Bash(...). Matching after a pipe would
-# greenlight pipelines like `Bash(git log ... | head -5)` because `head` is
-# safe — even though the command starts with an unapproved `git`.
-BASH_CMD_RE = re.compile(
-    rf'Bash\s*\(\s*({SAFE_BASH_CMDS})\b',
-    re.IGNORECASE,
+SAFE_BASH_START = re.compile(rf'\s*({SAFE_BASH_CMDS})\b', re.IGNORECASE)
+
+# The approval prompt — require the real numbered MENU Claude Code renders:
+# "Do you want to proceed?" then "1. Yes" then a "2." option. Demanding the
+# 1→2 structure (not just a stray "1. Yes") keeps prose that merely quotes the
+# prompt — e.g. discussing this script inside a session — from triggering us.
+# Bounded gaps keep the match from spanning unrelated output.
+PROMPT_RE = re.compile(
+    r'Do you want to proceed\?.{0,400}?\b1\.\s*Yes\b.{0,400}?\b2\.',
+    re.DOTALL,
 )
-# The approval prompt — require the numbered bullet form Claude Code
-# actually renders ("1. Yes"), not just any "Yes". Bounded distance keeps
-# it from spanning unrelated output.
-PROMPT_RE = re.compile(r'Do you want to proceed\?.{0,400}?\b1\.\s*Yes\b', re.DOTALL)
-# Only trust signals inside the trailing slice of visible output — the
-# live prompt is always at the bottom of the screen. Without this, prose
-# or quoted code higher up (e.g. this script's own patterns discussed in
-# chat) can spuriously match.
-TAIL_WINDOW = 800
 
+# Tuning.
+TAIL_WINDOW = 900      # the live prompt is always at the bottom of the screen
+BUF_MAX = 16000        # how far back we look for the pending tool's header
+COOLDOWN = 0.8         # seconds after a fire before we may fire again
+SETTLE = 0.08          # let the prompt finish rendering before we re-verify
 
-MULTI_SPACE_RE = re.compile(r' {2,}')
 
 def strip_ansi(data: bytes) -> str:
     # Replace ANSI sequences with a space (cursor moves act as spaces)
     text = ANSI_RE.sub(b' ', data).decode('utf-8', errors='ignore')
     # Collapse multiple spaces into one
     return MULTI_SPACE_RE.sub(' ', text)
+
+
+def classify_pending_tool(text: str):
+    """Return True if the most recent tool-call header in `text` is a safe
+    read-only tool, False if it is some other (unsafe) tool, or None if no
+    recognized tool header is present.
+
+    The pending tool is always the LAST recognized `Name(` header before the
+    prompt — Claude renders the tool header immediately above its permission
+    box, so the bottom-most header is the one being asked about.
+    """
+    last = None
+    for m in KNOWN_TOOL_RE.finditer(text):
+        last = m
+    if last is None:
+        return None
+    name = last.group(1)
+    if name == 'Bash':
+        return bool(SAFE_BASH_START.match(text[last.end():]))
+    return name in SAFE_TOOLS
+
+
+class Detector:
+    """Decides, from a rolling buffer of stripped terminal text, whether the
+    auto-approval keystroke should be sent. Pure w.r.t. I/O so it can be
+    exercised by test_detector.py without a real PTY."""
+
+    def __init__(self):
+        self.text_buf = ''
+        self.armed = True          # may we fire for the current screen state?
+        self.cooldown_until = 0.0  # monotonic timestamp
+
+    def feed(self, stripped: str) -> None:
+        self.text_buf = (self.text_buf + stripped)[-BUF_MAX:]
+
+    def poll(self, now: float) -> bool:
+        """Return True if the approval keystroke should be sent now. Also
+        re-arms (and discards stale scrollback) whenever the screen has no
+        live prompt, so a previously-answered prompt can't re-trigger us."""
+        tail = self.text_buf[-TAIL_WINDOW:]
+        if not PROMPT_RE.search(tail):
+            # No live prompt on screen: ready for the next one, and drop old
+            # scrollback so an answered prompt lingering above can't re-match.
+            self.armed = True
+            if len(self.text_buf) > TAIL_WINDOW:
+                self.text_buf = tail
+            return False
+        if not self.armed or now < self.cooldown_until:
+            return False
+        return classify_pending_tool(self.text_buf) is True
+
+    def commit_fired(self, now: float) -> None:
+        """Record that we just sent the keystroke: disarm until the prompt
+        clears, start the cooldown, and drop everything through the answered
+        prompt so its text can't re-match."""
+        self.armed = False
+        self.cooldown_until = now + COOLDOWN
+        tail = self.text_buf[-TAIL_WINDOW:]
+        last = None
+        for m in PROMPT_RE.finditer(tail):
+            last = m
+        if last is not None:
+            abs_end = len(self.text_buf) - len(tail) + last.end()
+            self.text_buf = self.text_buf[abs_end:]
 
 
 def get_terminal_size() -> tuple[int, int]:
@@ -127,14 +213,47 @@ def main() -> None:
     old_attrs = termios.tcgetattr(sys.stdin)
     tty.setraw(sys.stdin.fileno())
 
-    text_buf = ''       # rolling window of STRIPPED text (not raw bytes)
-    cooldown = 0.0      # timestamp: don't auto-approve again until after this time
-    BUF_MAX = 16000     # characters of visible text — plenty for tool name + prompt
+    det = Detector()
+
+    def drain_pending() -> None:
+        """Read whatever claude has buffered right now, mirror it, and feed
+        the detector — without blocking."""
+        while True:
+            try:
+                r2, _, _ = select.select([master_fd], [], [], 0)
+            except (ValueError, select.error):
+                return
+            if master_fd not in r2:
+                return
+            try:
+                more = os.read(master_fd, 16384)
+            except OSError:
+                return
+            if not more:
+                return
+            os.write(sys.stdout.fileno(), more)
+            det.feed(strip_ansi(more))
+
+    def maybe_approve() -> None:
+        """If a safe prompt is showing, settle, re-verify it's STILL there,
+        then send the approval keystroke."""
+        if not det.poll(time.monotonic()):
+            return
+        # Let Claude finish painting, then re-read and re-check. Without this
+        # we can inject "1" into a prompt that was already dismissed.
+        time.sleep(SETTLE)
+        drain_pending()
+        now = time.monotonic()
+        if det.poll(now):
+            os.write(master_fd, b'1\r')
+            det.commit_fired(now)
 
     try:
         while True:
             try:
-                rfds, _, _ = select.select([master_fd, sys.stdin.fileno()], [], [], 0.05)
+                rfds, _, _ = select.select(
+                    [master_fd, sys.stdin.fileno()], [], [], 0.05
+                )
             except (ValueError, select.error):
                 break
 
@@ -145,41 +264,7 @@ def main() -> None:
                 except OSError:
                     break
                 os.write(sys.stdout.fileno(), data)
-
-                # Buffer stripped text so ANSI bloat doesn't eat our window
-                text_buf = (text_buf + strip_ansi(data))[-BUF_MAX:]
-                now = time.monotonic()
-
-                tail = text_buf[-TAIL_WINDOW:]
-                if now > cooldown and PROMPT_RE.search(tail):
-                    is_safe_tool = bool(TOOL_RE.search(tail))
-                    is_safe_bash = bool(BASH_CMD_RE.search(tail))
-                    if is_safe_tool or is_safe_bash:
-                        # Set cooldown immediately: even if re-verify aborts,
-                        # we don't want to re-fire on the same stale buffer.
-                        cooldown = now + 3.0
-                        # Let Claude settle, then drain any new output that
-                        # arrived during the pause and re-verify the prompt
-                        # is STILL on screen. Without this, auto-dismissed
-                        # prompts cause us to inject "1" into the idle
-                        # chat input line after the prompt is gone.
-                        time.sleep(0.1)
-                        try:
-                            while True:
-                                r2, _, _ = select.select([master_fd], [], [], 0)
-                                if master_fd not in r2:
-                                    break
-                                more = os.read(master_fd, 16384)
-                                if not more:
-                                    break
-                                os.write(sys.stdout.fileno(), more)
-                                text_buf = (text_buf + strip_ansi(more))[-BUF_MAX:]
-                        except OSError:
-                            pass
-                        tail = text_buf[-TAIL_WINDOW:]
-                        if PROMPT_RE.search(tail):
-                            os.write(master_fd, b'1\r')
-                            text_buf = ''
+                det.feed(strip_ansi(data))
 
             # Input from user → claude
             if sys.stdin.fileno() in rfds:
@@ -191,6 +276,10 @@ def main() -> None:
                     os.write(master_fd, data)
                 except OSError:
                     break
+
+            # Re-check on every loop turn (including the 0.05s timeout) so a
+            # prompt that already finished rendering still gets approved.
+            maybe_approve()
 
             # Check if claude exited
             wpid, _ = os.waitpid(pid, os.WNOHANG)
