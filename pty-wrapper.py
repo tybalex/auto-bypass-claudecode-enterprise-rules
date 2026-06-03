@@ -36,7 +36,7 @@ import tty
 # Human-readable version. Bump when you change detection behavior. The content
 # hash in the startup banner is the authoritative identifier; this is just a
 # friendly label.
-__version__ = "2026-06-02"
+__version__ = "2026-06-03"
 
 # Strip ANSI/VT escape sequences (CSI, OSC, two-byte, etc.)
 ANSI_RE = re.compile(
@@ -50,30 +50,51 @@ ANSI_RE = re.compile(
 MULTI_SPACE_RE = re.compile(r' {2,}')
 
 # --- Tool classification ---------------------------------------------------
+# We classify the PENDING tool from the permission box that Claude renders just
+# above the prompt — NOT from transcript "Bash(...)" / "Read(...)" tool-call
+# headers, which belong to ALREADY-COMPLETED calls (and aren't shown at all for
+# subagent calls). The box looks like:
+#
+#     Bash command
+#       grep -r "..." /path --include="*.ts" -l | head -20
+#       Run shell command
+#     Permission rule Bash requires confirmation for this command.
+#     Do you want to proceed?
+#     ❯ 1. Yes
+#       2. Yes, and don't ask again ...
+#
 # Read-only tools we auto-approve.
 SAFE_TOOLS = ('Read', 'Glob', 'Grep', 'ToolSearch', 'TaskGet', 'TaskList')
-# Other tools we recognize purely so a pending unsafe tool is classified as
-# unsafe (and therefore NOT auto-approved) instead of falling back to an older,
-# already-answered safe header still sitting in the buffer.
+SAFE_TOOLS_SET = frozenset(SAFE_TOOLS)
+# Other tools we recognize only so a pending unsafe tool is seen as unsafe
+# instead of falling back to a safe name lingering elsewhere in the buffer.
 OTHER_TOOLS = (
     'Bash', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'Task', 'Agent',
     'WebFetch', 'WebSearch', 'TaskCreate', 'TaskUpdate', 'TaskStop',
     'KillShell', 'BashOutput', 'SlashCommand', 'ExitPlanMode', 'EnterPlanMode',
 )
-# A tool-call header as Claude Code renders it: `Name(`. Requiring the paren
-# keeps us from matching the tool *names* when they appear in ordinary prose.
-KNOWN_TOOL_RE = re.compile(
-    r'\b(' + '|'.join(SAFE_TOOLS + OTHER_TOOLS) + r')\s*\(',
-)
-# Bash read-only commands, matched against the start of the command inside
-# `Bash(...)`. Git is intentionally excluded: even read-only git subcommands
-# are not in the enterprise auto-approve ruleset. To auto-approve read-only
-# git too, add `|git\s+(status|log|diff|show|branch|remote|tag)` here.
+
+# Bash read-only commands. Git is intentionally excluded: even read-only git
+# subcommands are not in the enterprise auto-approve ruleset. To auto-approve
+# read-only git too, add e.g. `|git` here (note: only the FIRST command word is
+# checked, so `echo x > f` / `find . -delete` would also be approved).
 SAFE_BASH_CMDS = (
     r'ls|find|head|wc|cat|grep|rg|tail|file|stat|du|df|pwd|echo|which'
     r'|whoami|env|printenv|uname|hostname|date|id'
 )
-SAFE_BASH_START = re.compile(rf'\s*({SAFE_BASH_CMDS})\b', re.IGNORECASE)
+# Whole-word test for the first token of a bash command.
+SAFE_BASH_WORD = re.compile(rf'(?:{SAFE_BASH_CMDS})\Z', re.IGNORECASE)
+# "Bash command" header, then (skipping box glyphs/whitespace) the first
+# command word. \W{0,80}? keeps the skip from running away if "Bash command"
+# shows up in prose with no command after it.
+BASH_BOX_RE = re.compile(r'Bash command\W{0,80}?([A-Za-z][\w./-]*)')
+# Some prompts state the rule explicitly, e.g. "Permission rule Bash requires…".
+PERM_RULE_RE = re.compile(r'Permission rule (\w+)')
+# Fallback: any known tool name appearing near the prompt (covers tool-call
+# headers like "Read(" / "Grep(" and box labels like "Read file").
+TOOL_NEAR_RE = re.compile(r'\b(' + '|'.join(SAFE_TOOLS + OTHER_TOOLS) + r')\b')
+# How far above the prompt to look for the box / tool identity.
+PROMPT_REGION = 3000
 
 # The approval prompt — require the real numbered MENU Claude Code renders:
 # "Do you want to proceed?" then "1. Yes" then a "2." option. Demanding the
@@ -87,7 +108,7 @@ PROMPT_RE = re.compile(
 
 # Tuning.
 TAIL_WINDOW = 900      # the live prompt is always at the bottom of the screen
-BUF_MAX = 16000        # how far back we look for the pending tool's header
+BUF_MAX = 16000        # rolling stripped-text buffer size
 COOLDOWN = 0.8         # seconds after a fire before we may fire again
 SETTLE = 0.08          # let the prompt finish rendering before we re-verify
 
@@ -99,24 +120,42 @@ def strip_ansi(data: bytes) -> str:
     return MULTI_SPACE_RE.sub(' ', text)
 
 
-def classify_pending_tool(text: str):
-    """Return True if the most recent tool-call header in `text` is a safe
-    read-only tool, False if it is some other (unsafe) tool, or None if no
-    recognized tool header is present.
+def _last(pattern, text):
+    m = None
+    for m in pattern.finditer(text):
+        pass
+    return m
 
-    The pending tool is always the LAST recognized `Name(` header before the
-    prompt — Claude renders the tool header immediately above its permission
-    box, so the bottom-most header is the one being asked about.
+
+def classify_pending_tool(text: str):
+    """Return True if the PENDING permission prompt is for a safe read-only
+    tool, False if it is for some other (unsafe) tool/command, or None if the
+    tool can't be identified.
+
+    Looks only at the region just above the prompt (where the permission box
+    lives), so it isn't fooled by completed `Bash(...)` headers higher up in
+    the transcript.
     """
-    last = None
-    for m in KNOWN_TOOL_RE.finditer(text):
-        last = m
-    if last is None:
-        return None
-    name = last.group(1)
-    if name == 'Bash':
-        return bool(SAFE_BASH_START.match(text[last.end():]))
-    return name in SAFE_TOOLS
+    region = text[-PROMPT_REGION:]
+
+    # 1) Bash command box — classify the FIRST word of the command.
+    box = _last(BASH_BOX_RE, region)
+    if box is not None:
+        return SAFE_BASH_WORD.match(box.group(1)) is not None
+
+    # 2) Explicit "Permission rule <Tool>" statement.
+    rule = _last(PERM_RULE_RE, region)
+    if rule is not None:
+        name = rule.group(1)
+        if name == 'Bash':
+            return None          # bash, but no command extracted → don't risk it
+        return name in SAFE_TOOLS_SET
+
+    # 3) Fallback: the last known tool name near the prompt.
+    near = _last(TOOL_NEAR_RE, region)
+    if near is not None:
+        return near.group(1) in SAFE_TOOLS_SET
+    return None
 
 
 class Detector:
@@ -126,41 +165,32 @@ class Detector:
 
     def __init__(self):
         self.text_buf = ''
-        self.armed = True          # may we fire for the current screen state?
         self.cooldown_until = 0.0  # monotonic timestamp
 
     def feed(self, stripped: str) -> None:
         self.text_buf = (self.text_buf + stripped)[-BUF_MAX:]
 
     def poll(self, now: float) -> bool:
-        """Return True if the approval keystroke should be sent now. Also
-        re-arms (and discards stale scrollback) whenever the screen has no
-        live prompt, so a previously-answered prompt can't re-trigger us."""
+        """Return True if the approval keystroke should be sent now."""
         tail = self.text_buf[-TAIL_WINDOW:]
         if not PROMPT_RE.search(tail):
-            # No live prompt on screen: ready for the next one, and drop old
-            # scrollback so an answered prompt lingering above can't re-match.
-            self.armed = True
+            # No live prompt on screen: drop old scrollback so a previously
+            # answered prompt lingering above can't re-match later.
             if len(self.text_buf) > TAIL_WINDOW:
                 self.text_buf = tail
             return False
-        if not self.armed or now < self.cooldown_until:
+        if now < self.cooldown_until:
             return False
         return classify_pending_tool(self.text_buf) is True
 
     def commit_fired(self, now: float) -> None:
-        """Record that we just sent the keystroke: disarm until the prompt
-        clears, start the cooldown, and drop everything through the answered
-        prompt so its text can't re-match."""
-        self.armed = False
+        """Record that we just sent the keystroke: clear the buffer (the prompt
+        on screen is being dismissed) and start a cooldown. The cooldown spans
+        the window in which Claude is still processing the keystroke / redrawing
+        the prompt, so neither the dismissed prompt nor its redraws re-fire — but
+        a genuinely new prompt right after the cooldown still gets approved."""
         self.cooldown_until = now + COOLDOWN
-        tail = self.text_buf[-TAIL_WINDOW:]
-        last = None
-        for m in PROMPT_RE.finditer(tail):
-            last = m
-        if last is not None:
-            abs_end = len(self.text_buf) - len(tail) + last.end()
-            self.text_buf = self.text_buf[abs_end:]
+        self.text_buf = ''
 
 
 def self_fingerprint() -> tuple[str, str]:

@@ -93,27 +93,28 @@ claude CLI (subprocess)
 3. Strips ANSI escape codes and buffers the visible text
 4. Detects an approval when **both** hold:
    - the real menu (`"Do you want to proceed?"` → `"1. Yes"` → `"2."`) is at the **bottom** of the screen, and
-   - the **most recent tool-call header** anywhere in the buffer is a safe read-only tool (or `Bash(<safe-cmd>…)`)
+   - the **permission box** just above it is for a safe read-only tool — a `Bash command` box whose first command word is read-only, or a read-only tool (`Read`/`Glob`/`Grep`/…)
 5. Re-verifies the prompt is still on screen, then sends `1` + Enter to accept "Yes"
 6. Handles `SIGWINCH` to forward terminal resize events
 
 ### Reliability details
 
 Earlier versions intermittently left `find`/`grep` prompts waiting for manual
-approval. Three things caused that, all addressed now:
+approval. The causes, all addressed now:
 
-- **Tool identified from the whole buffer, not a fixed window.** A long
-  `find`/`grep` command (or a tall prompt box) pushed the `● Bash(…)` / `Grep(…)`
-  header far above the `1. Yes` line. The old code required both within ~800–1500
-  characters of each other, so it missed those. Detection now matches the prompt
-  at the bottom of the screen but identifies the pending tool from the **last
-  tool-call header anywhere in the buffer**.
+- **The pending command is read from the permission box, not the transcript.**
+  A Bash permission prompt renders as a `Bash command` box with the raw command
+  and `Permission rule Bash …` — *not* as `Bash(...)`. The `Bash(...)` form only
+  appears for already-**completed** calls in the transcript (and not at all for
+  subagent calls). Detection now classifies the first word of the command in the
+  box, so a subagent's `grep`/`find` is approved even when the only `Bash(...)`
+  text on screen belongs to earlier, unrelated commands.
 - **Re-checks on idle, not only on new output.** The detector runs every loop
   turn — including the `select()` timeout — so a prompt that finished rendering
   and then sits static still gets approved.
-- **No stray `1`.** An `armed` latch (cleared on fire, re-armed only once the
-  screen shows no prompt) plus a short cooldown stop a just-answered prompt from
-  re-triggering a `1` into the chat input.
+- **No stray `1`.** On approval the buffer is cleared and a short cooldown
+  starts, so the prompt being dismissed (and any redraws of it) can't re-fire a
+  `1` into the chat input, while a genuinely new prompt right after still does.
 
 > **Note:** the wrapper loads the script once at launch. After updating
 > `pty-wrapper.py`, **restart your `cw` session** for changes to take effect.
