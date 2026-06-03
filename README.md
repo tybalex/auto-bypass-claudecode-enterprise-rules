@@ -46,6 +46,25 @@ alias cw="python3.13 ~/.claude/pty-wrapper.py"
 
 Adjust `python3.13` to match your Python 3.10+ binary.
 
+### Knowing which version a session runs
+
+`cw` prints a banner at startup identifying the build it loaded:
+
+```
+[cw] pty-wrapper 2026-06-02 · 3f9a1c2b · modified Jun 02 15:35 · auto-approving read-only tools
+```
+
+The middle field is a SHA-256 prefix of the script as this process read it. To
+confirm a session matches the file on disk:
+
+```bash
+shasum -a 256 ~/.claude/pty-wrapper.py | cut -c1-8
+```
+
+If the hashes match, that session is running the current code. Because the
+script is loaded once at launch, **updating `pty-wrapper.py` requires
+restarting `cw`** for the change to take effect.
+
 ### Usage
 
 ```bash

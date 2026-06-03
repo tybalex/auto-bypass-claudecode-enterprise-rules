@@ -160,6 +160,13 @@ raw = b"\x1b[2m\x1b[38;5;241m Do you want\x1b[0m   to    proceed?\x1b[?25l"
 check("Do you want to proceed?" in pw.strip_ansi(raw),
       "strip_ansi: removes CSI codes and collapses spaces")
 
+# --- version banner --------------------------------------------------------
+_digest, _mtime = pw.self_fingerprint()
+check(re.fullmatch(r"[0-9a-f]{8}", _digest) is not None,
+      "fingerprint: returns an 8-char hex content hash")
+check(isinstance(pw.__version__, str) and pw.__version__,
+      "fingerprint: __version__ is a non-empty string")
+
 print()
 if _FAILS:
     print(f"{len(_FAILS)} CHECK(S) FAILED")

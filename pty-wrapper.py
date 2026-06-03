@@ -21,6 +21,7 @@ Detection design (see test_detector.py for the spec it must satisfy):
     into the chat input after a prompt has already been answered.
 """
 import fcntl
+import hashlib
 import os
 import pty
 import re
@@ -31,6 +32,11 @@ import sys
 import termios
 import time
 import tty
+
+# Human-readable version. Bump when you change detection behavior. The content
+# hash in the startup banner is the authoritative identifier; this is just a
+# friendly label.
+__version__ = "2026-06-02"
 
 # Strip ANSI/VT escape sequences (CSI, OSC, two-byte, etc.)
 ANSI_RE = re.compile(
@@ -157,6 +163,33 @@ class Detector:
             self.text_buf = self.text_buf[abs_end:]
 
 
+def self_fingerprint() -> tuple[str, str]:
+    """Return (short content hash, human mtime) of THIS running script, read
+    from disk at call time — i.e. the exact bytes this process loaded. Two
+    sessions with the same hash are provably running identical code."""
+    try:
+        with open(__file__, 'rb') as fh:
+            digest = hashlib.sha256(fh.read()).hexdigest()[:8]
+    except OSError:
+        digest = '????????'
+    try:
+        mtime = time.strftime('%b %d %H:%M', time.localtime(os.stat(__file__).st_mtime))
+    except OSError:
+        mtime = '?'
+    return digest, mtime
+
+
+def print_banner() -> None:
+    """One dim line identifying the wrapper version, shown before claude
+    starts so you always know which build a session is running."""
+    digest, mtime = self_fingerprint()
+    line = (f"[cw] pty-wrapper {__version__} · {digest} · modified {mtime}"
+            f" · auto-approving read-only tools")
+    # \x1b[2m = dim; \r\n is safe whether or not the tty is in raw mode yet.
+    sys.stdout.write(f"\x1b[2m{line}\x1b[0m\r\n")
+    sys.stdout.flush()
+
+
 def get_terminal_size() -> tuple[int, int]:
     """Get real terminal size via ioctl on stdin."""
     try:
@@ -178,6 +211,7 @@ def set_winsize(fd: int, rows: int, cols: int) -> None:
 
 
 def main() -> None:
+    print_banner()
     rows, cols = get_terminal_size()
     master_fd, slave_fd = pty.openpty()
     set_winsize(master_fd, rows, cols)
